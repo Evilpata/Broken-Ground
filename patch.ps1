@@ -2,7 +2,12 @@
 #  Broken Ground - Local Multiplayer Patch Script v2
 #  Tüm yamalar + Goldberg Steam Emulator otomatik kurulur.
 #  Run as: Right-click -> "Run with PowerShell"
+#  Or: patch.ps1 -GameDir "C:\path\to\Broken Ground"
 # ============================================================
+
+param(
+    [string]$GameDir = ""
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -14,33 +19,57 @@ Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host ""
 
 # ── 1. Find game directory ────────────────────────────────────────────────
-$steamPaths = @(
-    "D:\SteamLibrary\steamapps\common\Broken Ground",
-    "C:\Program Files (x86)\Steam\steamapps\common\Broken Ground",
-    "C:\Program Files\Steam\steamapps\common\Broken Ground",
-    "E:\SteamLibrary\steamapps\common\Broken Ground",
-    "F:\SteamLibrary\steamapps\common\Broken Ground",
-    "G:\SteamLibrary\steamapps\common\Broken Ground",
-    "$env:USERPROFILE\Desktop\Broken Ground",
-    "$env:ProgramFiles\Steam\steamapps\common\Broken Ground"
-)
 
-$gameDir = $null
-foreach ($p in $steamPaths) {
-    if (Test-Path (Join-Path $p "BrokenGround.exe")) {
-        $gameDir = $p
-        break
+# If launched from BrokenGroundGame.exe, GameDir is passed directly
+$gameDir = $GameDir.Trim('"').Trim("'")
+
+if (-not $gameDir) {
+    # Auto-detect from common Steam paths
+    # Use only drives that actually exist to avoid Join-Path errors
+    $existingDrives = (Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Root)
+
+    $steamRelative = @(
+        "SteamLibrary\steamapps\common\Broken Ground",
+        "Steam\steamapps\common\Broken Ground",
+        "Program Files (x86)\Steam\steamapps\common\Broken Ground",
+        "Program Files\Steam\steamapps\common\Broken Ground"
+    )
+
+    foreach ($drive in $existingDrives) {
+        foreach ($rel in $steamRelative) {
+            $candidate = Join-Path $drive $rel
+            if (Test-Path (Join-Path $candidate "BrokenGround.exe") -ErrorAction SilentlyContinue) {
+                $gameDir = $candidate
+                break
+            }
+        }
+        if ($gameDir) { break }
+    }
+
+    # Also check next to the script itself (if patch.ps1 is in game folder)
+    if (-not $gameDir) {
+        $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+        if (Test-Path (Join-Path $scriptDir "BrokenGround.exe") -ErrorAction SilentlyContinue) {
+            $gameDir = $scriptDir
+        }
     }
 }
 
 if (-not $gameDir) {
+    # Last resort: ask user (only works when run manually, not from EXE)
     Write-Host ""
     Write-Host "Oyun klasoru otomatik bulunamadi!" -ForegroundColor Yellow
     Write-Host "Oyunun kurulu oldugu klasoru tam yoluyla girin." -ForegroundColor Gray
-    Write-Host "(ornek: D:\Games\Broken Ground)" -ForegroundColor Gray
+    Write-Host "(ornek: C:\Program Files (x86)\Steam\steamapps\common\Broken Ground)" -ForegroundColor Gray
     Write-Host ""
-    $gameDir = Read-Host "Oyun klasoru"
-    $gameDir = $gameDir.Trim('"').Trim("'")
+    try {
+        $gameDir = Read-Host "Oyun klasoru"
+        $gameDir = $gameDir.Trim('"').Trim("'")
+    } catch {
+        Write-Host "HATA: Otomatik modda calistirildi, oyun klasoru bulunamadi." -ForegroundColor Red
+        Write-Host "BrokenGroundGame.exe oyun klasorunde mi? Kontrol edin." -ForegroundColor Yellow
+        exit 1
+    }
 }
 
 if (-not (Test-Path (Join-Path $gameDir "BrokenGround.exe"))) {

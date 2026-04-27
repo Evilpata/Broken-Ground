@@ -197,9 +197,13 @@ class SetupForm : Form {
     }
 
     void RunPs1(string ps1Path) {
+        // Pass GameDir as parameter so patch.ps1 doesn't need to auto-detect
+        // (avoids errors on drives that don't exist on this machine)
+        string args = "-NonInteractive -ExecutionPolicy Bypass -File \"" + ps1Path + "\"" +
+                      " -GameDir \"" + Program.GameDir + "\"";
         var psi = new ProcessStartInfo {
             FileName               = "powershell.exe",
-            Arguments              = "-NonInteractive -ExecutionPolicy Bypass -File \"" + ps1Path + "\"",
+            Arguments              = args,
             UseShellExecute        = false,
             RedirectStandardOutput = true,
             RedirectStandardError  = true,
