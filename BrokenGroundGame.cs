@@ -180,6 +180,10 @@ class SetupForm : Form {
         string local = Path.Combine(Program.GameDir, "patch.ps1");
         if (File.Exists(local)) { WriteLog("  Bulundu: " + local); return local; }
 
+        // TLS 1.2 gerekli (GitHub, .NET 4.x default TLS1.0 kullanir)
+        ServicePointManager.SecurityProtocol =
+            SecurityProtocolType.Tls12 | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls;
+
         WriteLog("  GitHub'dan indiriliyor...", Color.Yellow);
         string tmp = Path.Combine(Path.GetTempPath(), "bg_patch_dl.ps1");
         using (var wc = new WebClient()) {
