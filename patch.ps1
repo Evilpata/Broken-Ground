@@ -650,17 +650,91 @@ try {
     Write-Host "  [15] TNetConnectionHandler.SendAuth() + SendMatchmakerAuth() -> NOP" -ForegroundColor Green
 } catch { Write-Host "  [15] HATA: $_" -ForegroundColor Red }
 
-# === PATCH 18: JoinGame.OnConnected() → prepend Loading.Hide() ===
-# OnConnected never calls Loading.Hide(), so spinner stays on top of lobby forever.
+# === PATCH 19: UserData.ReadUserDataIntoPlayerData → NOP ===
+# We pass null dictionaries (no PlayFab data), so the method would crash on ContainsKey(null).
+# NOP it — outfit defaults to whatever PlayerData ctor sets.
 try {
-    $jgType18   = $module.Types | Where-Object { $_.Name -eq "JoinGame" }
-    $onConnM18  = $jgType18.Methods | Where-Object { $_.Name -eq "OnConnected" }
-    $hideMth18  = ($module.Types | Where-Object { $_.Name -eq "Loading" }).Methods | Where-Object { $_.Name -eq "Hide" -and $_.Parameters.Count -eq 0 }
+    $udType19  = $module.Types | Where-Object { $_.Name -eq "UserData" }
+    $readUD19  = $udType19.Methods | Where-Object { $_.Name -eq "ReadUserDataIntoPlayerData" }
+    PatchReturnVoid $readUD19
+    Write-Host "  [19] UserData.ReadUserDataIntoPlayerData -> NOP (null dict guvenli)" -ForegroundColor Green
+} catch { Write-Host "  [19] HATA: $_" -ForegroundColor Red }
+
+# === PATCH 20: UserData.LoadUserData → direkt Common.OnGotPlayerData cagir (PlayFab bypass) ===
+# PlayFab sunucusu kapali, callback hic donemez => oyuncu lobi kartı hic acilmaz.
+# Cozum: LoadUserData dogrudan OnGotPlayerData'yi cagirsin (null data ile).
+# Common.OnGotPlayerData(int playerID, string displayName, dict, dict, list)
+try {
+    $udType20      = $module.Types | Where-Object { $_.Name -eq "UserData" }
+    $loadUD20      = $udType20.Methods | Where-Object { $_.Name -eq "LoadUserData" -and $_.Parameters.Count -eq 3 }
+    $commonType20  = $module.Types | Where-Object { $_.Name -eq "Common" }
+    $onGotPD20     = $commonType20.Methods | Where-Object { $_.Name -eq "OnGotPlayerData" }
+
+    $loadUD20.Body.Instructions.Clear()
+    $loadUD20.Body.Variables.Clear()
+    $loadUD20.Body.ExceptionHandlers.Clear()
+    $p20 = $loadUD20.Body.GetILProcessor()
+    # Common.OnGotPlayerData(playerID, playFabId, null, null, null)
+    $p20.Append($p20.Create([Mono.Cecil.Cil.OpCodes]::Ldarg_0))   # playerID (int)
+    $p20.Append($p20.Create([Mono.Cecil.Cil.OpCodes]::Ldarg_1))   # playFabId (string = displayName)
+    $p20.Append($p20.Create([Mono.Cecil.Cil.OpCodes]::Ldnull))    # userData dict
+    $p20.Append($p20.Create([Mono.Cecil.Cil.OpCodes]::Ldnull))    # readOnlyData dict
+    $p20.Append($p20.Create([Mono.Cecil.Cil.OpCodes]::Ldnull))    # statistics list
+    $p20.Append($p20.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($onGotPD20)))
+    $p20.Append($p20.Create([Mono.Cecil.Cil.OpCodes]::Ret))
+    Write-Host "  [20] UserData.LoadUserData -> Common.OnGotPlayerData direkt (PlayFab bypass)" -ForegroundColor Green
+} catch { Write-Host "  [20] HATA: $_" -ForegroundColor Red }
+
+# === PATCH 18: JoinGame.OnConnected() → Loading.Hide() + lokal oyuncuyu lobiye kaydet ===
+# OnConnected never calls Loading.Hide(), spinner stays forever.
+# Also: server never sends NewPlayer packet for local player → lobby slots stay empty.
+# Fix: register local player immediately when we connect.
+try {
+    $jgType18      = $module.Types | Where-Object { $_.Name -eq "JoinGame" }
+    $onConnM18     = $jgType18.Methods | Where-Object { $_.Name -eq "OnConnected" }
+    $hideMth18     = ($module.Types | Where-Object { $_.Name -eq "Loading" }).Methods | Where-Object { $_.Name -eq "Hide" -and $_.Parameters.Count -eq 0 }
+    $commonType18  = $module.Types | Where-Object { $_.Name -eq "Common" }
+    $createPD18    = $commonType18.Methods | Where-Object { $_.Name -eq "CreatePlayerData" }
+    $udType18      = $module.Types | Where-Object { $_.Name -eq "UserData" }
+    $loadUD18      = $udType18.Methods | Where-Object { $_.Name -eq "LoadUserData" -and $_.Parameters.Count -eq 3 }
+    $gmType18      = $module.Types | Where-Object { $_.Name -eq "GameManager" }
+    $gmPlayerFld18 = $gmType18.Fields | Where-Object { $_.Name -eq "loggedInPlayerData" }
+    $pdType18      = $module.Types | Where-Object { $_.Name -eq "PlayerData" }
+    $getDispMth18  = $pdType18.Methods | Where-Object { $_.Name -eq "get_displayName" }
+    $tnsType18     = $module.Types | Where-Object { $_.FullName -eq "TNet.TNServerInstance" }
+    # Use TNet.TNManager.get_playerID() (static)
+    $tnMgrType18   = $module.Types | Where-Object { $_.FullName -eq "TNet.TNManager" }
+    $getPIDMth18   = $tnMgrType18.Methods | Where-Object { $_.Name -eq "get_playerID" }
+
     $il18 = $onConnM18.Body.GetILProcessor()
     $first18 = $onConnM18.Body.Instructions[0]
-    $hideCall = $il18.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($hideMth18))
-    $il18.InsertBefore($first18, $hideCall)
-    Write-Host "  [18] JoinGame.OnConnected() -> Loading.Hide() prepended (spinner kapanir)" -ForegroundColor Green
+
+    # Build instructions to prepend (in reverse order since InsertBefore shifts)
+    # Order: Loading.Hide() → CreatePlayerData(id, name) → pop → LoadUserData(id, name, null)
+    $ins_ret = $il18.Create([Mono.Cecil.Cil.OpCodes]::Nop)  # placeholder, not actually inserted
+
+    # 1. Loading.Hide()
+    $i_hide = $il18.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($hideMth18))
+
+    # 2. Common.CreatePlayerData(TNManager.playerID, loggedInPlayerData.displayName)
+    $i_getid1  = $il18.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($getPIDMth18))
+    $i_getpd1  = $il18.Create([Mono.Cecil.Cil.OpCodes]::Ldsfld, $module.ImportReference($gmPlayerFld18))
+    $i_getdn1  = $il18.Create([Mono.Cecil.Cil.OpCodes]::Callvirt, $module.ImportReference($getDispMth18))
+    $i_create  = $il18.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($createPD18))
+    $i_pop     = $il18.Create([Mono.Cecil.Cil.OpCodes]::Pop)  # discard returned PlayerData
+
+    # 3. UserData.LoadUserData(TNManager.playerID, displayName, null) → calls OnGotPlayerData directly
+    $i_getid2  = $il18.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($getPIDMth18))
+    $i_getpd2  = $il18.Create([Mono.Cecil.Cil.OpCodes]::Ldsfld, $module.ImportReference($gmPlayerFld18))
+    $i_getdn2  = $il18.Create([Mono.Cecil.Cil.OpCodes]::Callvirt, $module.ImportReference($getDispMth18))
+    $i_null    = $il18.Create([Mono.Cecil.Cil.OpCodes]::Ldnull)  # callback = null
+    $i_load    = $il18.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($loadUD18))
+
+    foreach ($ins in @($i_hide, $i_getid1, $i_getpd1, $i_getdn1, $i_create, $i_pop,
+                        $i_getid2, $i_getpd2, $i_getdn2, $i_null, $i_load)) {
+        $il18.InsertBefore($first18, $ins)
+    }
+    Write-Host "  [18] JoinGame.OnConnected() -> Hide spinner + kaydet lokal oyuncu (lobi kartı gorunur)" -ForegroundColor Green
 } catch { Write-Host "  [18] HATA: $_" -ForegroundColor Red }
 
 # ── 5. Write patched DLL ───────────────────────────────────────────────────
