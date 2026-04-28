@@ -282,15 +282,20 @@ try {
 } catch { Write-Host "  [2] ATLANDI: $_" -ForegroundColor Yellow }
 
 # === PATCH 3: JoinGame.CheckIfServerIsShutDown → onSuccess() ===
+# FIX: param is UnityEngine.Events.UnityAction, NOT System.Action — use correct Invoke ref
 try {
     $jg_check = $jgType.Methods | Where-Object { $_.Name -eq "CheckIfServerIsShutDown" }
     $jg_check.Body.Instructions.Clear(); $jg_check.Body.Variables.Clear(); $jg_check.Body.ExceptionHandlers.Clear()
     $p3 = $jg_check.Body.GetILProcessor()
     $actionOpc3 = if ($jg_check.IsStatic) { [Mono.Cecil.Cil.OpCodes]::Ldarg_0 } else { [Mono.Cecil.Cil.OpCodes]::Ldarg_1 }
+    # Build correct Invoke ref for the actual parameter type (UnityAction or Action)
+    $jgParamTypeRef = $module.ImportReference($jg_check.Parameters[0].ParameterType)
+    $jgInvokeRef    = New-Object Mono.Cecil.MethodReference("Invoke", $module.TypeSystem.Void, $jgParamTypeRef)
+    $jgInvokeRef.HasThis = $true
     $p3.Append($p3.Create($actionOpc3))
-    $p3.Append($p3.Create([Mono.Cecil.Cil.OpCodes]::Callvirt, $invokeRef))
+    $p3.Append($p3.Create([Mono.Cecil.Cil.OpCodes]::Callvirt, $jgInvokeRef))
     $p3.Append($p3.Create([Mono.Cecil.Cil.OpCodes]::Ret))
-    Write-Host "  [3] JoinGame.CheckIfServerIsShutDown -> onSuccess() ($( if ($jg_check.IsStatic) {'static'} else {'instance'}))" -ForegroundColor Green
+    Write-Host "  [3] JoinGame.CheckIfServerIsShutDown -> onSuccess() ($( if ($jg_check.IsStatic) {'static'} else {'instance'})) [UnityAction fix]" -ForegroundColor Green
 } catch { Write-Host "  [3] ATLANDI: $_" -ForegroundColor Yellow }
 
 # === PATCH 4: Login.LoginPlayFab(string,string) → env-var bypass ===
@@ -408,6 +413,219 @@ try {
     $gp.Append($gp.Create([Mono.Cecil.Cil.OpCodes]::Ret))
     Write-Host "  [12] PlayerData.get_displayName() -> fallback to BG_NAME env var" -ForegroundColor Green
 } catch { Write-Host "  [12] HATA: $_" -ForegroundColor Red }
+
+# Helper: TNet host connect via JoinGame.Connect (properly fires OnConnected callback)
+function ApplyTNetConnect($method, $isAlwaysHost) {
+    $tnsType_h  = $module.Types | Where-Object { $_.FullName -eq "TNet.TNServerInstance" }
+    $jgType_h   = $module.Types | Where-Object { $_.Name -eq "JoinGame" }
+    $showMth_h  = $loadingType.Methods | Where-Object { $_.Name -eq "Show" -and $_.Parameters.Count -eq 2 }
+
+    # TNServerInstance.Start(int tcpPort, bool lanBroadcast) — PUBLIC STATIC, accessible!
+    $tnsStart2Mth_h = $tnsType_h.Methods | Where-Object {
+        $_.Name -eq "Start" -and $_.Parameters.Count -eq 2 -and
+        $_.Parameters[0].ParameterType.Name -eq "Int32" -and
+        $_.Parameters[1].ParameterType.Name -eq "Boolean"
+    }
+    # JoinGame.Connect(string lobbyID, string ip, int port, string ticket, bool asHost)
+    $jgConnMth_h = $jgType_h.Methods | Where-Object { $_.Name -eq "Connect" -and $_.Parameters.Count -eq 5 }
+
+    $method.Body.Instructions.Clear()
+    $method.Body.Variables.Clear()
+    $method.Body.ExceptionHandlers.Clear()
+    $method.Body.InitLocals = $true
+    $method.Body.Variables.Add((New-Object Mono.Cecil.Cil.VariableDefinition($module.TypeSystem.String)))  # 0=mode
+    $method.Body.Variables.Add((New-Object Mono.Cecil.Cil.VariableDefinition($module.TypeSystem.String)))  # 1=ip
+
+    $ph = $method.Body.GetILProcessor()
+
+    # Create target instructions first (forward refs)
+    $ih_stloc0   = $ph.Create([Mono.Cecil.Cil.OpCodes]::Stloc_0)
+    $ih_stloc1   = $ph.Create([Mono.Cecil.Cil.OpCodes]::Stloc_1)
+    # Join branch label: ldstr "" (lobbyID arg to JoinGame.Connect)
+    $ih_joinLbl  = $ph.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, "")
+
+    # mode = GetEnv("BG_MODE") ?? "host"
+    $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, "BG_MODE"))
+    $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Call, $getEnvRef))
+    $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Dup))
+    $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Brtrue, $ih_stloc0))
+    $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Pop))
+    $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, "host"))
+    $ph.Append($ih_stloc0)
+
+    # ip = GetEnv("BG_IP") ?? ""
+    $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, "BG_IP"))
+    $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Call, $getEnvRef))
+    $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Dup))
+    $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Brtrue, $ih_stloc1))
+    $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Pop))
+    $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, ""))
+    $ph.Append($ih_stloc1)
+
+    # Loading.Show("Connecting...", null)
+    $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, "Connecting..."))
+    $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldnull))
+    $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($showMth_h)))
+
+    if ($isAlwaysHost) {
+        # Always host: Start TNet server first, then connect as host
+        # TNServerInstance.Start(5127, false) — returns bool, pop it
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4, 5127))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4_0))   # lanBroadcast=false
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($tnsStart2Mth_h)))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Pop))         # discard bool return
+        # JoinGame.Connect("", "127.0.0.1", 5127, "", true)
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, ""))      # lobbyID
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, "127.0.0.1"))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4, 5127))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, ""))      # ticket
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4_1))       # asHost=true
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($jgConnMth_h)))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ret))
+    } else {
+        # Dynamic mode (Quick Play): check BG_MODE env var
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldloc_0))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, "join"))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Call, $strEqRef))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Brtrue, $ih_joinLbl))
+
+        # HOST path: Start TNet server, then connect as host
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4, 5127))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4_0))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($tnsStart2Mth_h)))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Pop))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, ""))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, "127.0.0.1"))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4, 5127))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, ""))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4_1))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($jgConnMth_h)))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ret))
+
+        # JOIN path: connect to host's IP
+        $ph.Append($ih_joinLbl)
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldloc_1))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4, 5127))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, ""))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4_0))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($jgConnMth_h)))
+        $ph.Append($ph.Create([Mono.Cecil.Cil.OpCodes]::Ret))
+    }
+}
+
+# === PATCH 13: FindGame.QuickPlayAttempt() → TNet JoinGame.Connect bypass (OnConnected fires) ===
+try {
+    $fjType2 = $module.Types | Where-Object { $_.Name -eq "FindGame" }
+    $qpaMth  = $fjType2.Methods | Where-Object { $_.Name -eq "QuickPlayAttempt" }
+    ApplyTNetConnect $qpaMth $false
+    Write-Host "  [13] FindGame.QuickPlayAttempt() -> JoinGame.Connect (host/join, OnConnected fires)" -ForegroundColor Green
+} catch { Write-Host "  [13] HATA: $_" -ForegroundColor Red }
+
+# === PATCH 16: CreateMultiplayer.ContinueLaunch() → bypass PlayFab.StartGame, use TNet host ===
+try {
+    $cmType  = $module.Types | Where-Object { $_.Name -eq "CreateMultiplayer" }
+    $clMth   = $cmType.Methods | Where-Object { $_.Name -eq "ContinueLaunch" }
+    $tnsType_cm = $module.Types | Where-Object { $_.FullName -eq "TNet.TNServerInstance" }
+    $jgType_cm  = $module.Types | Where-Object { $_.Name -eq "JoinGame" }
+    $showMth_cm = $loadingType.Methods | Where-Object { $_.Name -eq "Show" -and $_.Parameters.Count -eq 2 }
+    $tnsGetInst_cm = $tnsType_cm.Methods | Where-Object { $_.Name -eq "get_instance" }
+    $tnsStart_cm   = $tnsType_cm.Methods | Where-Object { $_.Name -eq "Start" -and $_.Parameters.Count -eq 3 -and $_.Parameters[0].ParameterType.Name -eq "Int32" }
+    $jgConn_cm     = $jgType_cm.Methods  | Where-Object { $_.Name -eq "Connect" -and $_.Parameters.Count -eq 5 }
+
+    $pCL = $clMth.Body.GetILProcessor()
+
+    # Find index of "newobj PlayFab.ClientModels.StartGameRequest" — cut from here
+    $cutIdx = -1
+    for ($ci = 0; $ci -lt $clMth.Body.Instructions.Count; $ci++) {
+        $ins = $clMth.Body.Instructions[$ci]
+        if ($ins.OpCode.Code -eq [Mono.Cecil.Cil.Code]::Newobj -and
+            $ins.Operand.ToString() -match "StartGameRequest") {
+            $cutIdx = $ci; break
+        }
+    }
+    if ($cutIdx -lt 0) { throw "StartGameRequest newobj bulunamadi" }
+
+    # Remove from cutIdx to end (preserve game-settings setup before that point)
+    while ($clMth.Body.Instructions.Count -gt $cutIdx) {
+        $pCL.Remove($clMth.Body.Instructions[$cutIdx])
+    }
+
+    # Append: Loading.Show + TNServerInstance.Start(5127,false) + JoinGame.Connect as host
+    $tnsType_cm    = $module.Types | Where-Object { $_.FullName -eq "TNet.TNServerInstance" }
+    $tnsStart2_cm  = $tnsType_cm.Methods | Where-Object {
+        $_.Name -eq "Start" -and $_.Parameters.Count -eq 2 -and
+        $_.Parameters[0].ParameterType.Name -eq "Int32" -and
+        $_.Parameters[1].ParameterType.Name -eq "Boolean"
+    }
+    $pCL.Append($pCL.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, "Connecting..."))
+    $pCL.Append($pCL.Create([Mono.Cecil.Cil.OpCodes]::Ldnull))
+    $pCL.Append($pCL.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($showMth_cm)))
+    # Start TNet server on port 5127
+    $pCL.Append($pCL.Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4, 5127))
+    $pCL.Append($pCL.Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4_0))      # lanBroadcast=false
+    $pCL.Append($pCL.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($tnsStart2_cm)))
+    $pCL.Append($pCL.Create([Mono.Cecil.Cil.OpCodes]::Pop))            # discard bool
+    # Connect as host to local server
+    $pCL.Append($pCL.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, ""))      # lobbyID
+    $pCL.Append($pCL.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, "127.0.0.1"))
+    $pCL.Append($pCL.Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4, 5127))
+    $pCL.Append($pCL.Create([Mono.Cecil.Cil.OpCodes]::Ldstr, ""))      # ticket
+    $pCL.Append($pCL.Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4_1))       # asHost=true
+    $pCL.Append($pCL.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($jgConn_cm)))
+    $pCL.Append($pCL.Create([Mono.Cecil.Cil.OpCodes]::Ret))
+
+    Write-Host "  [16] CreateMultiplayer.ContinueLaunch() -> TNet host (CREATE butonu artik calisir)" -ForegroundColor Green
+} catch { Write-Host "  [16] HATA: $_" -ForegroundColor Red }
+
+# === PATCH 17: CreateMultiplayer.QuickPlayAttempt() → always host (Start server + connect) ===
+try {
+    $cmType2  = $module.Types | Where-Object { $_.Name -eq "CreateMultiplayer" }
+    $cmQpaMth = $cmType2.Methods | Where-Object { $_.Name -eq "QuickPlayAttempt" }
+    ApplyTNetConnect $cmQpaMth $true
+    Write-Host "  [17] CreateMultiplayer.QuickPlayAttempt() -> TNet Start + JoinGame.Connect host" -ForegroundColor Green
+} catch { Write-Host "  [17] HATA: $_" -ForegroundColor Red }
+
+# === PATCH 14: GameManager.HasAuthority() → offlineMode || TNServerInstance.isActive ===
+# Analiz: orijinal NetworkServer.active kullanıyor (Unity UNET),
+# TNet'te bu her zaman false döner. TNServerInstance.isActive ile değiştir.
+try {
+    $gmType2    = $module.Types | Where-Object { $_.Name -eq "GameManager" }
+    $tnsType3   = $module.Types | Where-Object { $_.FullName -eq "TNet.TNServerInstance" }
+    $hasMth2    = $gmType2.Methods | Where-Object { $_.Name -eq "HasAuthority" }
+    $tnsIsActProp = $tnsType3.Methods | Where-Object { $_.Name -eq "get_isActive" }
+    $gmOffFld2  = $gmType2.Fields | Where-Object { $_.Name -eq "offlineMode" }
+
+    $hasMth2.Body.Instructions.Clear()
+    $hasMth2.Body.Variables.Clear()
+    $hasMth2.Body.ExceptionHandlers.Clear()
+    $p14 = $hasMth2.Body.GetILProcessor()
+
+    $trueIns = $p14.Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4_1)
+    # if (offlineMode) return true
+    $p14.Append($p14.Create([Mono.Cecil.Cil.OpCodes]::Ldsfld, $module.ImportReference($gmOffFld2)))
+    $p14.Append($p14.Create([Mono.Cecil.Cil.OpCodes]::Brtrue, $trueIns))
+    # return TNServerInstance.isActive
+    $p14.Append($p14.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($tnsIsActProp)))
+    $p14.Append($p14.Create([Mono.Cecil.Cil.OpCodes]::Ret))
+    $p14.Append($trueIns)
+    $p14.Append($p14.Create([Mono.Cecil.Cil.OpCodes]::Ret))
+
+    Write-Host "  [14] GameManager.HasAuthority() -> offlineMode || TNServerInstance.isActive" -ForegroundColor Green
+} catch { Write-Host "  [14] HATA: $_" -ForegroundColor Red }
+
+# === PATCH 15: TNetConnectionHandler.SendAuth() + SendMatchmakerAuth() → NOP ===
+# Analiz: bu metodlar sunucuya PlayFab ticket gönderiyorlar (paket 129/130).
+# Local TNet sunucusu bu paketleri işlemez/beklemez, auth yeterli.
+# sessionTicket = IP adresi olduğu için paket gönderilir ama sunucu doğrulamaz.
+# Güvenli taraf: NOP yaparak gereksiz network trafiğini önleyelim.
+try {
+    $tncType3   = $module.Types | Where-Object { $_.Name -eq "TNetConnectionHandler" }
+    $sendAuthM  = $tncType3.Methods | Where-Object { $_.Name -eq "SendAuth" }
+    $sendMaM    = $tncType3.Methods | Where-Object { $_.Name -eq "SendMatchmakerAuth" }
+    PatchReturnVoid $sendAuthM
+    PatchReturnVoid $sendMaM
+    Write-Host "  [15] TNetConnectionHandler.SendAuth() + SendMatchmakerAuth() -> NOP" -ForegroundColor Green
+} catch { Write-Host "  [15] HATA: $_" -ForegroundColor Red }
 
 # ── 5. Write patched DLL ───────────────────────────────────────────────────
 Write-Host ""
@@ -736,12 +954,25 @@ try {
 }
 
 # ── 9. Copy launcher to game dir ───────────────────────────────────────────
+# FIX: Copy-Item hatasını önle — kaynak ve hedef aynı klasörde olabilir
 if ($launcherOut -and (Test-Path $launcherOut)) {
-    Copy-Item $launcherOut $launcherDst -Force
-    Write-Host "  [L] BrokenGroundLauncher.exe oyun klasorune kopyalandi" -ForegroundColor Green
+    $srcFull = [System.IO.Path]::GetFullPath($launcherOut)
+    $dstFull = [System.IO.Path]::GetFullPath($launcherDst)
+    if ($srcFull -ne $dstFull) {
+        Copy-Item $launcherOut $launcherDst -Force
+        Write-Host "  [L] BrokenGroundLauncher.exe oyun klasorune kopyalandi" -ForegroundColor Green
+    } else {
+        Write-Host "  [L] BrokenGroundLauncher.exe zaten oyun klasoründe (kopyalama atlandı)" -ForegroundColor Gray
+    }
 } elseif (Test-Path (Join-Path $PSScriptRoot "BrokenGroundLauncher.exe")) {
-    Copy-Item (Join-Path $PSScriptRoot "BrokenGroundLauncher.exe") $launcherDst -Force
-    Write-Host "  [L] BrokenGroundLauncher.exe kopyalandi (mevcut)" -ForegroundColor Green
+    $srcFull2 = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "BrokenGroundLauncher.exe"))
+    $dstFull2 = [System.IO.Path]::GetFullPath($launcherDst)
+    if ($srcFull2 -ne $dstFull2) {
+        Copy-Item (Join-Path $PSScriptRoot "BrokenGroundLauncher.exe") $launcherDst -Force
+        Write-Host "  [L] BrokenGroundLauncher.exe kopyalandi (mevcut)" -ForegroundColor Green
+    } else {
+        Write-Host "  [L] BrokenGroundLauncher.exe zaten yerinde (kopyalama atlandı)" -ForegroundColor Gray
+    }
 }
 
 # ── 10. Firewall rules (optional) ─────────────────────────────────────────
