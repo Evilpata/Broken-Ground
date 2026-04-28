@@ -627,6 +627,19 @@ try {
     Write-Host "  [15] TNetConnectionHandler.SendAuth() + SendMatchmakerAuth() -> NOP" -ForegroundColor Green
 } catch { Write-Host "  [15] HATA: $_" -ForegroundColor Red }
 
+# === PATCH 18: JoinGame.OnConnected() → prepend Loading.Hide() ===
+# OnConnected never calls Loading.Hide(), so spinner stays on top of lobby forever.
+try {
+    $jgType18   = $module.Types | Where-Object { $_.Name -eq "JoinGame" }
+    $onConnM18  = $jgType18.Methods | Where-Object { $_.Name -eq "OnConnected" }
+    $hideMth18  = ($module.Types | Where-Object { $_.Name -eq "Loading" }).Methods | Where-Object { $_.Name -eq "Hide" -and $_.Parameters.Count -eq 0 }
+    $il18 = $onConnM18.Body.GetILProcessor()
+    $first18 = $onConnM18.Body.Instructions[0]
+    $hideCall = $il18.Create([Mono.Cecil.Cil.OpCodes]::Call, $module.ImportReference($hideMth18))
+    $il18.InsertBefore($first18, $hideCall)
+    Write-Host "  [18] JoinGame.OnConnected() -> Loading.Hide() prepended (spinner kapanir)" -ForegroundColor Green
+} catch { Write-Host "  [18] HATA: $_" -ForegroundColor Red }
+
 # ── 5. Write patched DLL ───────────────────────────────────────────────────
 Write-Host ""
 Write-Host "Yamali DLL yaziliyor..." -ForegroundColor Gray
