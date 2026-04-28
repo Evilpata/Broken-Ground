@@ -24,33 +24,56 @@ Write-Host ""
 $gameDir = $GameDir.Trim('"').Trim("'")
 
 if (-not $gameDir) {
-    # Auto-detect from common Steam paths
-    # Use only drives that actually exist to avoid Join-Path errors
+    # 1) Script'in yanında mı? (patch.ps1 oyun klasörüne koyulduysa)
+    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    if ($scriptDir -and (Test-Path (Join-Path $scriptDir "BrokenGround.exe") -ErrorAction SilentlyContinue)) {
+        $gameDir = $scriptDir
+    }
+}
+
+if (-not $gameDir) {
+    # 2) Tüm sürücülerdeki yaygın yolları tara
     $existingDrives = (Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Root)
 
-    $steamRelative = @(
+    $relPaths = @(
         "SteamLibrary\steamapps\common\Broken Ground",
         "Steam\steamapps\common\Broken Ground",
         "Program Files (x86)\Steam\steamapps\common\Broken Ground",
-        "Program Files\Steam\steamapps\common\Broken Ground"
+        "Program Files\Steam\steamapps\common\Broken Ground",
+        "Games\Broken Ground",
+        "Broken Ground"
     )
 
     foreach ($drive in $existingDrives) {
-        foreach ($rel in $steamRelative) {
+        foreach ($rel in $relPaths) {
             $candidate = Join-Path $drive $rel
             if (Test-Path (Join-Path $candidate "BrokenGround.exe") -ErrorAction SilentlyContinue) {
-                $gameDir = $candidate
-                break
+                $gameDir = $candidate; break
             }
         }
         if ($gameDir) { break }
     }
+}
 
-    # Also check next to the script itself (if patch.ps1 is in game folder)
-    if (-not $gameDir) {
-        $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-        if (Test-Path (Join-Path $scriptDir "BrokenGround.exe") -ErrorAction SilentlyContinue) {
-            $gameDir = $scriptDir
+if (-not $gameDir) {
+    # 3) Tüm kullanıcı profillerindeki Desktop / OneDrive\Desktop yollarını tara
+    $usersRoot = "C:\Users"
+    if (Test-Path $usersRoot) {
+        $userDirs = Get-ChildItem $usersRoot -Directory -ErrorAction SilentlyContinue
+        $desktopRels = @(
+            "Desktop\Broken Ground",
+            "OneDrive\Desktop\Broken Ground",
+            "Desktop\BrokenGround",
+            "OneDrive\Desktop\BrokenGround"
+        )
+        foreach ($u in $userDirs) {
+            foreach ($rel in $desktopRels) {
+                $candidate = Join-Path $u.FullName $rel
+                if (Test-Path (Join-Path $candidate "BrokenGround.exe") -ErrorAction SilentlyContinue) {
+                    $gameDir = $candidate; break
+                }
+            }
+            if ($gameDir) { break }
         }
     }
 }
